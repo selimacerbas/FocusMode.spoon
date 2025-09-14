@@ -12,10 +12,10 @@ A Hammerspoon Spoon that helps you stay in flow by **dimming everything except w
 ## 🎥 Demo
 
 ### App Focus
-<video src="assets/app_focus.mp4" width="700" controls></video>
+![App Focus](assets/app_focus.gif)
 
 ### Mouse Dimming
-<video src="assets/mouse_dimming.mp4" width="700" controls></video>
+![Mouse Dimming](assets/mouse_dimming.gif)
 
 ---
 
