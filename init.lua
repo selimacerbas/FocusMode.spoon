@@ -1,40 +1,46 @@
 --- === FocusMode ===
 --- A Hammerspoon Spoon that dims everything except your focused app
 --- (and optionally the app under your mouse cursor).
-local obj                  = {}
-obj.__index                = obj
 
-obj.name                   = "FocusMode"
-obj.version                = "0.0.1"
-obj.author                 = "Selim Acerbas"
-obj.homepage               = "https://github.com/selimacerbas/FocusMode.spoon"
-obj.license                = "MIT"
+local obj                         = {}
+obj.__index                       = obj
+
+obj.name                          = "FocusMode"
+obj.version                       = "0.1.0" -- add: screenshot-aware suspend/resume
+obj.author                        = "Selim Acerbas"
+obj.homepage                      = "https://github.com/selimacerbas/FocusMode.spoon"
+obj.license                       = "MIT"
 
 -- ==========
 -- Settings (can be changed by users before :start())
 -- ==========
 
 --- Dim overlay opacity (0..1). 0.45 is a gentle shade; increase to dim more strongly.
-obj.dimAlpha               = 0.45
+obj.dimAlpha                      = 0.45
 
 --- Corner radius for undimmed windows (visual nicety). Set to 0 for sharp edges.
-obj.windowCornerRadius     = 6
+obj.windowCornerRadius            = 6
 
 --- If true, the app under the mouse pointer is also undimmed (even if it isn't focused).
 --- (Renamed from `mouseUndim` → `mouseDim`; old key is still honored.)
-obj.mouseDim               = true
+obj.mouseDim                      = true
 
 --- Throttle for mouse move updates, in seconds (prevents excessive redraws).
-obj.mouseUpdateThrottle    = 0.05
+obj.mouseUpdateThrottle           = 0.05
 
 --- Debounce for focus/move/resize event bursts (helps tilers like PaperWM settle frames)
-obj.eventSettleDelay       = 0.03
+obj.eventSettleDelay              = 0.03
+
+--- Screenshot awareness: temporarily hide overlays while taking screenshots
+obj.screenshotAware               = true
+obj.screenshotSuspendSecondsShort = 3.0  -- ⌘⇧3 / ⌘⇧4 quick captures
+obj.screenshotSuspendSecondsUI    = 12.0 -- ⌘⇧5 toolbar (longer session)
 
 --- If true, bind default hotkeys automatically when the Spoon is loaded.
-obj.autoBindDefaultHotkeys = true
+obj.autoBindDefaultHotkeys        = true
 
 --- Default hotkeys (users can override with :bindHotkeys).
-obj.defaultHotkeys         = {
+obj.defaultHotkeys                = {
     start = { { "ctrl", "alt", "cmd" }, "I" },
     stop  = { { "ctrl", "alt", "cmd" }, "O" },
 }
@@ -43,15 +49,21 @@ obj.defaultHotkeys         = {
 -- Internals
 -- ==========
 
-obj._log                   = hs.logger.new("FocusMode", "info")
-obj._overlays              = {}  -- screenUUID -> hs.canvas
-obj._wf                    = nil -- hs.window.filter instance
-obj._screenWatcher         = nil -- hs.screen.watcher
-obj._mouseTap              = nil -- hs.eventtap for mouse moved
-obj._mouseTimer            = nil -- throttle timer for mouse
-obj._redrawTimer           = nil -- debounce timer for redraw coalescing
-obj._menubar               = nil -- hs.menubar indicator
-obj._running               = false
+obj._log                          = hs.logger.new("FocusMode", "info")
+obj._overlays                     = {}  -- screenUUID -> hs.canvas
+obj._wf                           = nil -- hs.window.filter instance
+obj._screenWatcher                = nil -- hs.screen.watcher
+obj._mouseTap                     = nil -- hs.eventtap for mouse moved
+obj._mouseTimer                   = nil -- throttle timer for mouse
+obj._redrawTimer                  = nil -- debounce timer for redraw coalescing
+obj._menubar                      = nil -- hs.menubar indicator
+obj._running                      = false
+
+-- Screenshot-awareness internals
+obj._suspended                    = false
+obj._suspendTimer                 = nil
+obj._ssKeyTap                     = nil -- keyDown tap for ⌘⇧3/4/5/6
+obj._ssAppWatcher                 = nil -- watches Screenshot app activation/termination
 
 -- Utility: shallow copy
 local function copy(t)
@@ -91,6 +103,44 @@ local function windowUnderMouse()
     return nil
 end
 
+-- ------------- Screenshot awareness helpers -------------
+
+local function _isScreenshotApp(app)
+    if not app then return false end
+    local bid = app:bundleID()
+    -- Known Apple screenshot UI bundle; keep name fallback for safety
+    if bid == "com.apple.screencaptureui" then return true end
+    local name = app:name() or ""
+    return (name == "Screenshot" or name == "Screen Shot" or name == "Grab")
+end
+
+function obj:_applySuspendState()
+    for _, cv in pairs(self._overlays) do
+        if self._suspended then cv:hide() else cv:show() end
+    end
+end
+
+function obj:_setSuspended(flag)
+    if self._suspended == flag then return end
+    self._suspended = flag
+    self:_applySuspendState()
+    -- Optional: nudge a redraw after resuming
+    if not flag then self:_scheduleRedraw() end
+end
+
+function obj:_suspendFor(seconds)
+    self:_setSuspended(true)
+    if self._suspendTimer then
+        self._suspendTimer:stop(); self._suspendTimer = nil
+    end
+    self._suspendTimer = hs.timer.doAfter(seconds or self.screenshotSuspendSecondsShort, function()
+        self._suspendTimer = nil
+        self:_setSuspended(false)
+    end)
+end
+
+-- --------------------------------------------------------
+
 -- Rebuild overlays for all screens if needed
 function obj:_ensureOverlays()
     local screens = hs.screen.allScreens()
@@ -121,11 +171,13 @@ function obj:_ensureOverlays()
                 roundedRectRadii = { xRadius = 0, yRadius = 0 },
             }
 
-            cv:show()
+            if self._suspended then cv:hide() else cv:show() end
             self._overlays[uuid] = cv
         else
             -- Keep the canvas positioned to the current screen frame (if resolution changed)
             self._overlays[uuid]:frame(s:frame())
+            -- Keep visibility consistent with suspend state
+            if self._suspended then self._overlays[uuid]:hide() else self._overlays[uuid]:show() end
         end
     end
 
@@ -154,6 +206,11 @@ function obj:_computeHolesPerScreen()
         local loc = { x = f.x - sFrame.x, y = f.y - sFrame.y, w = f.w, h = f.h }
         holes[uuid] = holes[uuid] or {}
         table.insert(holes[uuid], loc)
+    end
+
+    -- If suspended (e.g., screenshot in progress), leave everything to macOS
+    if self._suspended then
+        return holes -- no holes -> overlay hidden anyway
     end
 
     -- 1) Undim all windows of the focused app
@@ -233,6 +290,7 @@ end
 -- Mouse move handling (throttled); schedule redraw to follow cursor without clicks
 function obj:_handleMouseMoved()
     if not self.mouseDim then return end
+    if self._suspended then return end -- no-op while screenshots
     self:_scheduleRedraw()
 end
 
@@ -250,6 +308,7 @@ function obj:_startWatchers()
     end
 
     local function onEvent()
+        if self._suspended then return end
         self:_scheduleRedraw()
     end
 
@@ -265,6 +324,7 @@ function obj:_startWatchers()
 
     -- Screen watcher (resolution/display changes)
     self._screenWatcher = hs.screen.watcher.new(function()
+        if self._suspended then return end
         self:_scheduleRedraw()
     end)
     self._screenWatcher:start()
@@ -280,6 +340,41 @@ function obj:_startWatchers()
         return false -- pass through
     end)
     self._mouseTap:start()
+
+    -- === Screenshot awareness ===
+    if self.screenshotAware then
+        -- 1) Key combo detector for ⌘⇧3/4/5/6 (do not consume the event)
+        local keyDown = hs.eventtap.event.types.keyDown
+        local kc = hs.keycodes.map
+        local K3, K4, K5, K6 = kc["3"], kc["4"], kc["5"], kc["6"]
+
+        self._ssKeyTap = hs.eventtap.new({ keyDown }, function(e)
+            local f = e:getFlags()
+            if f and f.cmd and f.shift then
+                local code = e:getKeyCode()
+                if code == K3 or code == K4 then
+                    self:_suspendFor(self.screenshotSuspendSecondsShort)
+                elseif code == K5 or code == K6 then
+                    self:_suspendFor(self.screenshotSuspendSecondsUI)
+                end
+            end
+            return false
+        end)
+        self._ssKeyTap:start()
+
+        -- 2) Watch for the Screenshot app (toolbar mode, ⌘⇧5)
+        self._ssAppWatcher = hs.application.watcher.new(function(appName, event, app)
+            if _isScreenshotApp(app) then
+                if event == hs.application.watcher.activated or event == hs.application.watcher.launched then
+                    self:_setSuspended(true)
+                elseif event == hs.application.watcher.deactivated or event == hs.application.watcher.terminated then
+                    -- give the system a moment to finish writing the file(s)
+                    self:_suspendFor(0.5)
+                end
+            end
+        end)
+        self._ssAppWatcher:start()
+    end
 end
 
 function obj:_stopWatchers()
@@ -295,6 +390,14 @@ function obj:_stopWatchers()
         self._mouseTap:stop()
         self._mouseTap = nil
     end
+    if self._ssKeyTap then
+        self._ssKeyTap:stop()
+        self._ssKeyTap = nil
+    end
+    if self._ssAppWatcher then
+        self._ssAppWatcher:stop()
+        self._ssAppWatcher = nil
+    end
     if self._mouseTimer then
         self._mouseTimer:stop()
         self._mouseTimer = nil
@@ -302,6 +405,10 @@ function obj:_stopWatchers()
     if self._redrawTimer then
         self._redrawTimer:stop()
         self._redrawTimer = nil
+    end
+    if self._suspendTimer then
+        self._suspendTimer:stop()
+        self._suspendTimer = nil
     end
 end
 
@@ -313,27 +420,27 @@ function obj:_showMenubar()
     self._menubar:setTooltip("FocusMode active")
     self._menubar:setMenu(function()
         local items = {
-            { title = "FocusMode is ON",                                       disabled = true },
+            { title = "FocusMode is " .. (self._suspended and "PAUSED" or "ON"), disabled = true },
             {
                 title = "Mouse Dimming " .. (self.mouseDim and "✓" or "✗"),
                 fn = function()
                     self.mouseDim = not self.mouseDim
-                    self:_scheduleRedraw()
+                    if not self._suspended then self:_scheduleRedraw() end
                 end
             },
-            { title = "Dim Opacity: " .. string.format("%.2f", self.dimAlpha), disabled = true },
+            { title = "Dim Opacity: " .. string.format("%.2f", self.dimAlpha),   disabled = true },
             {
                 title = "Brighter (+)",
                 fn = function()
                     self.dimAlpha = math.max(0.00, self.dimAlpha - 0.05)
-                    self:_scheduleRedraw()
+                    if not self._suspended then self:_scheduleRedraw() end
                 end
             },
             {
                 title = "Dimmer (−)",
                 fn = function()
                     self.dimAlpha = math.min(0.95, self.dimAlpha + 0.05)
-                    self:_scheduleRedraw()
+                    if not self._suspended then self:_scheduleRedraw() end
                 end
             },
             { title = "—", disabled = true },
