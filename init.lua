@@ -6,7 +6,7 @@ local obj                         = {}
 obj.__index                       = obj
 
 obj.name                          = "FocusMode"
-obj.version                       = "0.1.0" -- add: screenshot-aware suspend/resume
+obj.version                       = "0.2.0" -- space-aware redraw, redraw optimization, tooltip, compat fix
 obj.author                        = "Selim Acerbas"
 obj.homepage                      = "https://github.com/selimacerbas/FocusMode.spoon"
 obj.license                       = "MIT"
@@ -64,6 +64,7 @@ obj._suspended                    = false
 obj._suspendTimer                 = nil
 obj._ssKeyTap                     = nil -- keyDown tap for ⌘⇧3/4/5/6
 obj._ssAppWatcher                 = nil -- watches Screenshot app activation/termination
+obj._spaceWatcher                 = nil -- hs.spaces.watcher for space changes
 
 -- Utility: shallow copy
 local function copy(t)
@@ -124,6 +125,7 @@ function obj:_setSuspended(flag)
     if self._suspended == flag then return end
     self._suspended = flag
     self:_applySuspendState()
+    self:_updateMenubarTooltip()
     -- Optional: nudge a redraw after resuming
     if not flag then self:_scheduleRedraw() end
 end
@@ -257,32 +259,45 @@ function obj:_redraw()
 
     local holesPerScreen = self:_computeHolesPerScreen()
 
-    -- For each overlay, rebuild the hole rectangles via destinationOut
     for uuid, cv in pairs(self._overlays) do
-        -- Clear hole elements (keep index 1 as the dim background)
-        local count = #cv
-        for i = count, 2, -1 do cv:removeElement(i) end
-
         local s = hs.screen.find(uuid)
         if s then
             local sFrame = s:frame()
             cv[1].frame = { x = 0, y = 0, w = sFrame.w, h = sFrame.h }
-            -- LIVE opacity updates without restart
             cv[1].fillColor = { red = 0, green = 0, blue = 0, alpha = self.dimAlpha }
         end
 
-        local holes = holesPerScreen[uuid]
-        if holes and #holes > 0 then
-            for _, r in ipairs(holes) do
-                cv:insertElement({
-                    type = "rectangle",
-                    action = "fill",
-                    fillColor = { red = 1, green = 1, blue = 1, alpha = 1 },
-                    frame = r,
-                    roundedRectRadii = { xRadius = self.windowCornerRadius, yRadius = self.windowCornerRadius },
-                    compositeRule = "destinationOut", -- punches a hole in the dim layer
-                })
-            end
+        local holes = holesPerScreen[uuid] or {}
+        local numHoles = #holes
+        local existingHoles = #cv - 1 -- element 1 is the dim background
+
+        -- Update existing hole elements in-place (avoids remove/reinsert churn)
+        for i = 1, math.min(numHoles, existingHoles) do
+            cv[i + 1].frame = holes[i]
+            cv[i + 1].roundedRectRadii = {
+                xRadius = self.windowCornerRadius,
+                yRadius = self.windowCornerRadius,
+            }
+        end
+
+        -- Add new hole elements if we have more holes than existing elements
+        for i = existingHoles + 1, numHoles do
+            cv:insertElement({
+                type = "rectangle",
+                action = "fill",
+                fillColor = { red = 1, green = 1, blue = 1, alpha = 1 },
+                frame = holes[i],
+                roundedRectRadii = {
+                    xRadius = self.windowCornerRadius,
+                    yRadius = self.windowCornerRadius,
+                },
+                compositeRule = "destinationOut",
+            })
+        end
+
+        -- Remove excess hole elements (iterate backward for stable indices)
+        for i = existingHoles, numHoles + 1, -1 do
+            cv:removeElement(i + 1)
         end
     end
 end
@@ -328,6 +343,15 @@ function obj:_startWatchers()
         self:_scheduleRedraw()
     end)
     self._screenWatcher:start()
+
+    -- Space change watcher: immediate redraw when switching Spaces
+    -- (overlays are canJoinAllSpaces but window filter is current-space-only,
+    --  so we must repaint holes immediately when the active space changes)
+    self._spaceWatcher = hs.spaces.watcher.new(function()
+        if self._suspended then return end
+        self:_redraw()
+    end)
+    self._spaceWatcher:start()
 
     -- Mouse tracking (throttled)
     self._mouseTap = hs.eventtap.new({ hs.eventtap.event.types.mouseMoved }, function(_, _)
@@ -386,6 +410,10 @@ function obj:_stopWatchers()
         self._screenWatcher:stop()
         self._screenWatcher = nil
     end
+    if self._spaceWatcher then
+        self._spaceWatcher:stop()
+        self._spaceWatcher = nil
+    end
     if self._mouseTap then
         self._mouseTap:stop()
         self._mouseTap = nil
@@ -417,7 +445,7 @@ function obj:_showMenubar()
     self._menubar = hs.menubar.new()
     if not self._menubar then return end
     self._menubar:setTitle("FM")
-    self._menubar:setTooltip("FocusMode active")
+    self:_updateMenubarTooltip()
     self._menubar:setMenu(function()
         local items = {
             { title = "FocusMode is " .. (self._suspended and "PAUSED" or "ON"), disabled = true },
@@ -450,6 +478,15 @@ function obj:_showMenubar()
     end)
 end
 
+function obj:_updateMenubarTooltip()
+    if not self._menubar then return end
+    if self._suspended then
+        self._menubar:setTooltip("FocusMode paused (screenshot)")
+    else
+        self._menubar:setTooltip("FocusMode active")
+    end
+end
+
 function obj:_hideMenubar()
     if self._menubar then
         self._menubar:delete()
@@ -466,7 +503,7 @@ function obj:start()
     self._running = true
 
     -- Backward compatibility: honor old config key if users still set it
-    if self.mouseUndim ~= nil and self.mouseDim == nil then
+    if self.mouseUndim ~= nil then
         self.mouseDim = self.mouseUndim
     end
 
