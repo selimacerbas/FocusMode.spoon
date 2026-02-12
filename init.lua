@@ -6,7 +6,7 @@ local obj                         = {}
 obj.__index                       = obj
 
 obj.name                          = "FocusMode"
-obj.version                       = "0.2.0" -- space-aware redraw, redraw optimization, tooltip, compat fix
+obj.version                       = "0.3.0" -- per-window focus, fade transitions, delayed dim
 obj.author                        = "Selim Acerbas"
 obj.homepage                      = "https://github.com/selimacerbas/FocusMode.spoon"
 obj.license                       = "MIT"
@@ -30,6 +30,18 @@ obj.mouseUpdateThrottle           = 0.05
 
 --- Debounce for focus/move/resize event bursts (helps tilers like PaperWM settle frames)
 obj.eventSettleDelay              = 0.03
+
+--- If true, only the single focused window is undimmed (not all windows of the focused app).
+--- Useful when you have multiple windows of the same app (e.g. Ghostty, Firefox).
+obj.perWindowFocus                = false
+
+--- Duration in seconds for departing windows to fade back into the dim.
+--- Set to 0 for instant dimming (v0.2 behavior).
+obj.fadeOutDuration               = 0.3
+
+--- Grace period in seconds before a departing hole starts fading.
+--- Switching back within this time instantly restores it. Set to 0 to start fading immediately.
+obj.dimDelay                      = 0.0
 
 --- Screenshot awareness: temporarily hide overlays while taking screenshots
 obj.screenshotAware               = true
@@ -65,6 +77,11 @@ obj._suspendTimer                 = nil
 obj._ssKeyTap                     = nil -- keyDown tap for ⌘⇧3/4/5/6
 obj._ssAppWatcher                 = nil -- watches Screenshot app activation/termination
 obj._spaceWatcher                 = nil -- hs.spaces.watcher for space changes
+
+-- Fade transition internals
+obj._prevHoles                    = {}  -- screenUUID -> {winId -> rect} from last redraw
+obj._retiringHoles                = {}  -- array of {uuid, winId, rect, alpha, createdAt, graceUntil}
+obj._fadeTimer                    = nil -- 30fps timer for animating retiring holes
 
 -- Utility: shallow copy
 local function copy(t)
@@ -124,6 +141,12 @@ end
 function obj:_setSuspended(flag)
     if self._suspended == flag then return end
     self._suspended = flag
+    if flag then
+        -- Entering suspend: stop any ongoing fades
+        self._retiringHoles = {}
+        self._prevHoles = {}
+        if self._fadeTimer then self._fadeTimer:stop(); self._fadeTimer = nil end
+    end
     self:_applySuspendState()
     self:_updateMenubarTooltip()
     -- Optional: nudge a redraw after resuming
@@ -193,21 +216,26 @@ function obj:_ensureOverlays()
 end
 
 -- Compute per-screen hole rectangles for windows to undim
+-- Returns: screenUUID -> array of {rect={x,y,w,h}, winId=number}
 function obj:_computeHolesPerScreen()
-    local holes = {} -- screenUUID -> array of rects (screen-local)
+    local holes = {} -- screenUUID -> array of {rect, winId}
     local frontApp = hs.application.frontmostApplication()
+    local seen = {} -- winId -> true, prevents duplicate holes
 
     local function addHoleForWindow(w)
         if not isValidWindow(w) then return end
+        local wid = w:id()
+        if not wid then return end
+        if seen[wid] then return end
+        seen[wid] = true
         local s = w:screen()
         if not s then return end
         local uuid = s:getUUID()
         local sFrame = s:frame()
         local f = w:frame()
-        -- Convert to screen-local coordinates
         local loc = { x = f.x - sFrame.x, y = f.y - sFrame.y, w = f.w, h = f.h }
         holes[uuid] = holes[uuid] or {}
-        table.insert(holes[uuid], loc)
+        table.insert(holes[uuid], { rect = loc, winId = wid })
     end
 
     -- If suspended (e.g., screenshot in progress), leave everything to macOS
@@ -215,24 +243,33 @@ function obj:_computeHolesPerScreen()
         return holes -- no holes -> overlay hidden anyway
     end
 
-    -- 1) Undim all windows of the focused app
-    if frontApp then
-        for _, w in ipairs(frontApp:allWindows()) do
-            if isValidWindow(w) then addHoleForWindow(w) end
+    -- 1) Undim focused window(s)
+    if self.perWindowFocus then
+        local fw = hs.window.focusedWindow()
+        if fw and isValidWindow(fw) then addHoleForWindow(fw) end
+    else
+        if frontApp then
+            for _, w in ipairs(frontApp:allWindows()) do
+                if isValidWindow(w) then addHoleForWindow(w) end
+            end
         end
     end
 
-    -- 2) Mouse-aware: undim entire app under the cursor (even if not focused)
+    -- 2) Mouse-aware: undim window/app under the cursor
     if self.mouseDim then
         local mw = windowUnderMouse()
         if mw then
-            local app = mw:application()
-            if app then
-                for _, w in ipairs(app:allWindows()) do
-                    if isValidWindow(w) then addHoleForWindow(w) end
-                end
-            else
+            if self.perWindowFocus then
                 addHoleForWindow(mw)
+            else
+                local app = mw:application()
+                if app then
+                    for _, w in ipairs(app:allWindows()) do
+                        if isValidWindow(w) then addHoleForWindow(w) end
+                    end
+                else
+                    addHoleForWindow(mw)
+                end
             end
         end
     end
@@ -258,7 +295,69 @@ function obj:_redraw()
     self:_ensureOverlays()
 
     local holesPerScreen = self:_computeHolesPerScreen()
+    local fadeEnabled = (self.fadeOutDuration or 0) > 0 or (self.dimDelay or 0) > 0
 
+    -- Build lookup of currently active window IDs
+    local activeIds = {}
+    for _, holeList in pairs(holesPerScreen) do
+        for _, h in ipairs(holeList) do
+            activeIds[h.winId] = true
+        end
+    end
+
+    if fadeEnabled then
+        local now = hs.timer.secondsSinceEpoch()
+
+        -- Diff: holes in _prevHoles but not in activeIds → retire them
+        for uuid, prevMap in pairs(self._prevHoles) do
+            for winId, rect in pairs(prevMap) do
+                if not activeIds[winId] then
+                    local alreadyRetiring = false
+                    for _, rh in ipairs(self._retiringHoles) do
+                        if rh.winId == winId then alreadyRetiring = true; break end
+                    end
+                    if not alreadyRetiring then
+                        table.insert(self._retiringHoles, {
+                            uuid       = uuid,
+                            winId      = winId,
+                            rect       = rect,
+                            alpha      = 1.0,
+                            createdAt  = now,
+                            graceUntil = now + (self.dimDelay or 0),
+                        })
+                    end
+                end
+            end
+        end
+
+        -- Promote: if a retiring window is back in active set, remove from retiring
+        for i = #self._retiringHoles, 1, -1 do
+            if activeIds[self._retiringHoles[i].winId] then
+                table.remove(self._retiringHoles, i)
+            end
+        end
+
+        -- Save current holes for next diff
+        self._prevHoles = {}
+        for uuid, holeList in pairs(holesPerScreen) do
+            self._prevHoles[uuid] = {}
+            for _, h in ipairs(holeList) do
+                self._prevHoles[uuid][h.winId] = h.rect
+            end
+        end
+
+        -- Start fade timer if needed
+        if #self._retiringHoles > 0 and not self._fadeTimer then
+            self._fadeTimer = hs.timer.doEvery(1 / 30, function()
+                self:_tickFade()
+            end)
+        end
+    else
+        self._prevHoles = {}
+        self._retiringHoles = {}
+    end
+
+    -- === Render all holes onto each canvas ===
     for uuid, cv in pairs(self._overlays) do
         local s = hs.screen.find(uuid)
         if s then
@@ -267,26 +366,38 @@ function obj:_redraw()
             cv[1].fillColor = { red = 0, green = 0, blue = 0, alpha = self.dimAlpha }
         end
 
-        local holes = holesPerScreen[uuid] or {}
-        local numHoles = #holes
-        local existingHoles = #cv - 1 -- element 1 is the dim background
+        -- Collect active holes (alpha=1) + retiring holes (fading alpha) for this screen
+        local allHoles = {}
+        local screenHoles = holesPerScreen[uuid] or {}
+        for _, h in ipairs(screenHoles) do
+            table.insert(allHoles, { rect = h.rect, alpha = 1.0 })
+        end
+        for _, rh in ipairs(self._retiringHoles) do
+            if rh.uuid == uuid then
+                table.insert(allHoles, { rect = rh.rect, alpha = rh.alpha })
+            end
+        end
 
-        -- Update existing hole elements in-place (avoids remove/reinsert churn)
+        local numHoles = #allHoles
+        local existingHoles = #cv - 1
+
+        -- Update existing hole elements in-place
         for i = 1, math.min(numHoles, existingHoles) do
-            cv[i + 1].frame = holes[i]
+            cv[i + 1].frame = allHoles[i].rect
+            cv[i + 1].fillColor = { red = 1, green = 1, blue = 1, alpha = allHoles[i].alpha }
             cv[i + 1].roundedRectRadii = {
                 xRadius = self.windowCornerRadius,
                 yRadius = self.windowCornerRadius,
             }
         end
 
-        -- Add new hole elements if we have more holes than existing elements
+        -- Add new hole elements
         for i = existingHoles + 1, numHoles do
             cv:insertElement({
                 type = "rectangle",
                 action = "fill",
-                fillColor = { red = 1, green = 1, blue = 1, alpha = 1 },
-                frame = holes[i],
+                fillColor = { red = 1, green = 1, blue = 1, alpha = allHoles[i].alpha },
+                frame = allHoles[i].rect,
                 roundedRectRadii = {
                     xRadius = self.windowCornerRadius,
                     yRadius = self.windowCornerRadius,
@@ -299,6 +410,48 @@ function obj:_redraw()
         for i = existingHoles, numHoles + 1, -1 do
             cv:removeElement(i + 1)
         end
+    end
+end
+
+-- Fade timer callback: animate retiring holes alpha and clean up finished ones
+function obj:_tickFade()
+    if #self._retiringHoles == 0 then
+        if self._fadeTimer then self._fadeTimer:stop(); self._fadeTimer = nil end
+        return
+    end
+
+    local now = hs.timer.secondsSinceEpoch()
+    local changed = false
+
+    for i = #self._retiringHoles, 1, -1 do
+        local h = self._retiringHoles[i]
+        if now >= h.graceUntil then
+            local elapsed = now - h.graceUntil
+            local duration = self.fadeOutDuration or 0.3
+            local newAlpha
+            if duration <= 0 then
+                newAlpha = 0
+            else
+                newAlpha = math.max(0, 1 - elapsed / duration)
+            end
+            if newAlpha ~= h.alpha then
+                h.alpha = newAlpha
+                changed = true
+            end
+        end
+        if h.alpha <= 0 then
+            table.remove(self._retiringHoles, i)
+            changed = true
+        end
+    end
+
+    if changed then
+        self:_redraw()
+    end
+
+    if #self._retiringHoles == 0 and self._fadeTimer then
+        self._fadeTimer:stop()
+        self._fadeTimer = nil
     end
 end
 
@@ -345,10 +498,12 @@ function obj:_startWatchers()
     self._screenWatcher:start()
 
     -- Space change watcher: immediate redraw when switching Spaces
-    -- (overlays are canJoinAllSpaces but window filter is current-space-only,
-    --  so we must repaint holes immediately when the active space changes)
+    -- Clear fade state to avoid ghost holes from previous space
     self._spaceWatcher = hs.spaces.watcher.new(function()
         if self._suspended then return end
+        self._retiringHoles = {}
+        self._prevHoles = {}
+        if self._fadeTimer then self._fadeTimer:stop(); self._fadeTimer = nil end
         self:_redraw()
     end)
     self._spaceWatcher:start()
@@ -438,6 +593,12 @@ function obj:_stopWatchers()
         self._suspendTimer:stop()
         self._suspendTimer = nil
     end
+    if self._fadeTimer then
+        self._fadeTimer:stop()
+        self._fadeTimer = nil
+    end
+    self._prevHoles = {}
+    self._retiringHoles = {}
 end
 
 function obj:_showMenubar()
@@ -453,6 +614,13 @@ function obj:_showMenubar()
                 title = "Mouse Dimming " .. (self.mouseDim and "✓" or "✗"),
                 fn = function()
                     self.mouseDim = not self.mouseDim
+                    if not self._suspended then self:_scheduleRedraw() end
+                end
+            },
+            {
+                title = "Per-Window Focus " .. (self.perWindowFocus and "✓" or "✗"),
+                fn = function()
+                    self.perWindowFocus = not self.perWindowFocus
                     if not self._suspended then self:_scheduleRedraw() end
                 end
             },
@@ -521,6 +689,8 @@ function obj:stop()
     if not self._running then return self end
     self._running = false
     self:_stopWatchers()
+    self._prevHoles = {}
+    self._retiringHoles = {}
     for uuid, cv in pairs(self._overlays) do
         cv:delete()
         self._overlays[uuid] = nil

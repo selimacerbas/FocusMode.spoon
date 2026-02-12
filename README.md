@@ -75,6 +75,9 @@ hs.loadSpoon("FocusMode")
 -- spoon.FocusMode.mouseDim = true
 -- spoon.FocusMode.windowCornerRadius = 6
 -- spoon.FocusMode.eventSettleDelay = 0.03 -- smoother with tilers
+-- spoon.FocusMode.perWindowFocus = true   -- only undim the focused window
+-- spoon.FocusMode.fadeOutDuration = 0.3   -- smooth fade when losing focus
+-- spoon.FocusMode.dimDelay = 1.0          -- 1s grace before dimming starts
 
 -- Optional: custom hotkeys
 -- spoon.FocusMode:bindHotkeys({
@@ -111,6 +114,9 @@ Set these before `:start()` in `init.lua`.
 | `mouseDim`               | `boolean`          | `true`   | If `true`, the entire app under your cursor stays undimmed (even when not focused).   |
 | `mouseUpdateThrottle`    | `number` (seconds) | `0.05`   | Throttle for mouse move handling; lower is more responsive, higher is lighter on CPU. |
 | `eventSettleDelay`       | `number` (seconds) | `0.03`   | Debounce for focus/move/resize bursts (useful with tilers like PaperWM).              |
+| `perWindowFocus`         | `boolean`          | `false`  | If `true`, only the focused window is undimmed (not all windows of that app).         |
+| `fadeOutDuration`        | `number` (seconds) | `0.3`    | Duration for departing windows to fade back into the dim. Set `0` for instant.        |
+| `dimDelay`               | `number` (seconds) | `0.0`    | Grace period before fading starts. Switch back within this time for instant undim.    |
 | `screenshotAware`               | `boolean`          | `true`   | Temporarily hide overlays when taking screenshots.                                    |
 | `screenshotSuspendSecondsShort` | `number` (seconds) | `3.0`    | How long to hide overlays for ⌘⇧3 / ⌘⇧4 captures.                                  |
 | `screenshotSuspendSecondsUI`    | `number` (seconds) | `12.0`   | How long to hide overlays for ⌘⇧5 toolbar mode.                                     |
