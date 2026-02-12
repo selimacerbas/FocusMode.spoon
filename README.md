@@ -25,7 +25,9 @@ A Hammerspoon Spoon that helps you stay in flow by **dimming everything except w
 * **Mouse-aware dimming** *(optional)*: the app under your cursor stays undimmed while you hover.
 * **Multi-display support**: per-screen overlays.
 * **Click-through overlays**: your clicks go straight to the apps underneath.
-* **Menu bar indicator**: “FM” icon with quick toggles and brightness controls.
+* **Menu bar indicator**: "FM" icon with quick toggles and brightness controls.
+* **Screenshot awareness**: automatically hides overlays during screenshots (⌘⇧3/4/5/6).
+* **Space-change handling**: immediate redraw when switching Spaces — no stale holes.
 * **PaperWM-friendly**: debounced redraws for smooth transitions when tiling or switching.
 
 ---
@@ -109,6 +111,9 @@ Set these before `:start()` in `init.lua`.
 | `mouseDim`               | `boolean`          | `true`   | If `true`, the entire app under your cursor stays undimmed (even when not focused).   |
 | `mouseUpdateThrottle`    | `number` (seconds) | `0.05`   | Throttle for mouse move handling; lower is more responsive, higher is lighter on CPU. |
 | `eventSettleDelay`       | `number` (seconds) | `0.03`   | Debounce for focus/move/resize bursts (useful with tilers like PaperWM).              |
+| `screenshotAware`               | `boolean`          | `true`   | Temporarily hide overlays when taking screenshots.                                    |
+| `screenshotSuspendSecondsShort` | `number` (seconds) | `3.0`    | How long to hide overlays for ⌘⇧3 / ⌘⇧4 captures.                                  |
+| `screenshotSuspendSecondsUI`    | `number` (seconds) | `12.0`   | How long to hide overlays for ⌘⇧5 toolbar mode.                                     |
 | `autoBindDefaultHotkeys` | `boolean`          | `true`   | Whether to bind default start/stop hotkeys automatically.                             |
 | `defaultHotkeys`         | `table`            | see code | Change the default hotkeys. Prefer `:bindHotkeys()` instead.                          |
 
@@ -155,9 +160,9 @@ local lastMoveAt = 0
 local function wrapMove(fn)
   return function()
     lastMoveAt = now()
-    -- optional: quiet FocusMode if it’s running and a suspend helper exists
-    if _G.FocusMode and FocusMode._running and FocusMode._suspend then
-      FocusMode:_suspend(1.2)
+    -- optional: quiet FocusMode if it's running
+    if _G.FocusMode and _G.FocusMode._running and _G.FocusMode._suspendFor then
+      _G.FocusMode:_suspendFor(1.2)
     end
     fn()                                      -- perform PaperWM move_window_N
     hs.timer.doAfter(0.25, A.refresh_windows) -- let Mission Control settle, then refresh
@@ -217,7 +222,7 @@ nav:bind({ "shift" }, "3", nil, wrapMove(A.move_window_3), nil, wrapMove(A.move_
 
 **Notes**
 
-* The wrappers above simply **delay refresh** calls and optionally **suspend** FocusMode if you have a helper like `FocusMode:_suspend(seconds)` in your local fork. FocusMode doesn’t require this, but it can reduce redraws while Spaces are in flight.
+* The wrappers above simply **delay refresh** calls and optionally **suspend** FocusMode via `FocusMode:_suspendFor(seconds)` to reduce redraws while Spaces are in flight.
 * You can also tune `spoon.FocusMode.eventSettleDelay` (e.g., `0.02`–`0.05`) for your machine.
 
 ---
