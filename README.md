@@ -147,49 +147,22 @@ Set these before `:start()` in `init.lua`.
 
 ## 🧭 PaperWM Integration (optional)
 
-FocusMode already works well with PaperWM thanks to `eventSettleDelay`. If you want extra smoothness during **window moves** and **Space switches**, you can wrap your PaperWM actions to let Mission Control settle and (optionally) quiet FocusMode briefly.
+FocusMode works well with PaperWM out of the box — `eventSettleDelay` debounces rapid tiling events, the space watcher handles Space switches, and `fadeOutDuration` smooths focus transitions. No manual `_suspendFor` calls are needed.
 
-> If you prefer referencing the Spoon as `FocusMode` (global), add:
->
-> ```lua
-> FocusMode = spoon.FocusMode
-> ```
+Only cross-space operations (moving windows, switching Spaces) need wrappers because the Spaces API is asynchronous.
 
-**Example: wrappers for moves/focus/switch**
+**Example: wrappers for moves and space switches**
 
 ```lua
--- ——— Space-safe wrappers; integrate with FocusMode and PaperWM ———
-local A = s.actions.actions() -- PaperWM actions table (zero-arg functions)
-local function now() return hs.timer.secondsSinceEpoch() end
-local lastMoveAt = 0
+local A = s.actions.actions() -- PaperWM actions table
 
+-- Wrapper for async Spaces operations (move window, switch space)
 local function wrapMove(fn)
   return function()
-    lastMoveAt = now()
-    -- optional: quiet FocusMode if it's running
-    if _G.FocusMode and _G.FocusMode._running and _G.FocusMode._suspendFor then
-      _G.FocusMode:_suspendFor(1.2)
-    end
-    fn()                                      -- perform PaperWM move_window_N
-    hs.timer.doAfter(0.25, A.refresh_windows) -- let Mission Control settle, then refresh
+    fn()
+    hs.timer.doAfter(0.25, A.refresh_windows)
   end
 end
-
-local function withRefresh(fn)
-  return function()
-    local dt = now() - lastMoveAt
-    if dt < 1.0 then
-      -- if this follows a move, give Spaces a tick before refreshing+focusing
-      hs.timer.doAfter(0.15, function()
-        A.refresh_windows(); fn()
-      end)
-    else
-      A.refresh_windows()
-      fn()
-    end
-  end
-end
-
 local function wrapSwitch(fn)
   return function()
     fn()
@@ -197,39 +170,27 @@ local function wrapSwitch(fn)
   end
 end
 
--- Sample nav bindings (adapt to your setup)
-nav:bind({}, "escape", function() nav:exit() end)
-nav:bind({ "cmd" }, "return", function() nav:exit() end)
+-- Focus/swap: direct calls, no wrapper needed
+nav:bind({}, "h", nil, A.focus_left,  nil, A.focus_left)
+nav:bind({}, "l", nil, A.focus_right, nil, A.focus_right)
+nav:bind({}, "j", nil, A.focus_down,  nil, A.focus_down)
+nav:bind({}, "k", nil, A.focus_up,    nil, A.focus_up)
 
-nav:bind({}, "h", nil, withRefresh(A.focus_left),  nil, withRefresh(A.focus_left))
-nav:bind({}, "l", nil, withRefresh(A.focus_right), nil, withRefresh(A.focus_right))
-nav:bind({}, "j", nil, withRefresh(A.focus_down),  nil, withRefresh(A.focus_down))
-nav:bind({}, "k", nil, withRefresh(A.focus_up),    nil, withRefresh(A.focus_up))
+nav:bind({ "shift" }, "h", nil, A.swap_left,  nil, A.swap_left)
+nav:bind({ "shift" }, "l", nil, A.swap_right, nil, A.swap_right)
 
-nav:bind({ "shift" }, "h", nil, withRefresh(A.swap_left),  nil, withRefresh(A.swap_left))
-nav:bind({ "shift" }, "j", nil, withRefresh(A.swap_down),  nil, withRefresh(A.swap_down))
-nav:bind({ "shift" }, "k", nil, withRefresh(A.swap_up),    nil, withRefresh(A.swap_up))
-nav:bind({ "shift" }, "l", nil, withRefresh(A.swap_right), nil, withRefresh(A.swap_right))
-
-nav:bind({}, "c", nil, A.center_window)
-nav:bind({}, "f", nil, A.full_width)
-nav:bind({}, "r", nil, A.cycle_width)
-
-nav:bind({}, ",", nil, wrapSwitch(A.switch_space_l), wrapSwitch(A.switch_space_l))
-nav:bind({}, ".", nil, wrapSwitch(A.switch_space_r), wrapSwitch(A.switch_space_r))
+-- Space switches and cross-space moves need the async wrapper
 nav:bind({}, "1", nil, wrapSwitch(A.switch_space_1), wrapSwitch(A.switch_space_1))
 nav:bind({}, "2", nil, wrapSwitch(A.switch_space_2), wrapSwitch(A.switch_space_2))
-nav:bind({}, "3", nil, wrapSwitch(A.switch_space_3), wrapSwitch(A.switch_space_3))
-
 nav:bind({ "shift" }, "1", nil, wrapMove(A.move_window_1), nil, wrapMove(A.move_window_1))
 nav:bind({ "shift" }, "2", nil, wrapMove(A.move_window_2), nil, wrapMove(A.move_window_2))
-nav:bind({ "shift" }, "3", nil, wrapMove(A.move_window_3), nil, wrapMove(A.move_window_3))
 ```
 
 **Notes**
 
-* The wrappers above simply **delay refresh** calls and optionally **suspend** FocusMode via `FocusMode:_suspendFor(seconds)` to reduce redraws while Spaces are in flight.
-* You can also tune `spoon.FocusMode.eventSettleDelay` (e.g., `0.02`–`0.05`) for your machine.
+* Focus and swap actions (`h/j/k/l`) call PaperWM directly — no wrappers, zero latency.
+* Only `wrapMove` and `wrapSwitch` add a 0.25s delayed `refresh_windows` to let Mission Control settle.
+* Tune `spoon.FocusMode.eventSettleDelay` (e.g., `0.02`–`0.05`) for your machine.
 
 ---
 
