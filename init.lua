@@ -6,7 +6,7 @@ local obj                         = {}
 obj.__index                       = obj
 
 obj.name                          = "FocusMode"
-obj.version                       = "0.3.0" -- per-window focus, fade transitions, delayed dim
+obj.version                       = "0.3.1"
 obj.author                        = "Selim Acerbas"
 obj.homepage                      = "https://github.com/selimacerbas/FocusMode.spoon"
 obj.license                       = "MIT"
@@ -82,6 +82,10 @@ obj._spaceWatcher                 = nil -- hs.spaces.watcher for space changes
 obj._prevHoles                    = {}  -- screenUUID -> {winId -> rect} from last redraw
 obj._retiringHoles                = {}  -- array of {uuid, winId, rect, alpha, createdAt, graceUntil}
 obj._fadeTimer                    = nil -- 30fps timer for animating retiring holes
+
+-- Mouse-window cache (avoids repeated hs.window.orderedWindows calls)
+obj._lastMouseWinId               = nil
+obj._lastMouseWinFrame            = nil
 
 -- Utility: shallow copy
 local function copy(t)
@@ -259,6 +263,10 @@ function obj:_computeHolesPerScreen()
     if self.mouseDim then
         local mw = windowUnderMouse()
         if mw then
+            -- Cache the mouse window frame to avoid hs.window.orderedWindows on next move
+            self._lastMouseWinId = mw:id()
+            self._lastMouseWinFrame = mw:frame()
+
             if self.perWindowFocus then
                 addHoleForWindow(mw)
             else
@@ -271,6 +279,9 @@ function obj:_computeHolesPerScreen()
                     addHoleForWindow(mw)
                 end
             end
+        else
+            self._lastMouseWinId = nil
+            self._lastMouseWinFrame = nil
         end
     end
 
@@ -459,6 +470,17 @@ end
 function obj:_handleMouseMoved()
     if not self.mouseDim then return end
     if self._suspended then return end -- no-op while screenshots
+
+    -- Fast path: if mouse is still within the cached window frame, skip redraw
+    if self._lastMouseWinFrame then
+        local pt = (type(hs.mouse.absolutePosition) == "function" and hs.mouse.absolutePosition())
+            or hs.mouse.getAbsolutePosition()
+        local f = self._lastMouseWinFrame
+        if pt.x >= f.x and pt.x <= f.x + f.w and pt.y >= f.y and pt.y <= f.y + f.h then
+            return
+        end
+    end
+
     self:_scheduleRedraw()
 end
 
@@ -477,6 +499,7 @@ function obj:_startWatchers()
 
     local function onEvent()
         if self._suspended then return end
+        self._lastMouseWinFrame = nil -- invalidate mouse cache on window changes
         self:_scheduleRedraw()
     end
 
@@ -599,6 +622,8 @@ function obj:_stopWatchers()
     end
     self._prevHoles = {}
     self._retiringHoles = {}
+    self._lastMouseWinId = nil
+    self._lastMouseWinFrame = nil
 end
 
 function obj:_showMenubar()
